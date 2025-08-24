@@ -600,17 +600,13 @@ async fn main() -> Result<()> {
     // Log server start to stderr (won't interfere with MCP protocol)
     eprintln!("Rusty Tools MCP Server starting...");
 
-    // Keep the server running indefinitely - MCP servers should not exit
-    loop {
-        match serve_server(server.clone(), transport.clone()).await {
-            Ok(()) => {
-                eprintln!("Server completed successfully, restarting...");
-            }
-            Err(e) => {
-                eprintln!("Server error: {}, restarting...", e);
-            }
-        }
-        // Brief pause before restarting to avoid tight loops
+    // Run the server - connection closures are normal in MCP
+    if let Err(e) = serve_server(server, transport).await {
+        eprintln!("Server error: {}", e);
+        // Brief pause before exiting to allow error message to be read
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+
+    eprintln!("Rusty Tools MCP Server shutting down");
+    Ok(())
 }
