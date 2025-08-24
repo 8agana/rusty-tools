@@ -39,10 +39,10 @@ cargo build --release
 
 ### Core Tools (Production Ready)
 
-- **cargo_build** - Check if code would build successfully
+- **cargo_build** - Build project (produces artifacts)
   ```rust
-  // Validates that code compiles without actually building artifacts
-  // Faster than full build, perfect for validation
+  // Compiles the temp project and reports compiler output
+  // Use `cargo_check` for faster type-checking without artifacts
   ```
 
 - **cargo_fmt** - Format Rust code using rustfmt
@@ -74,7 +74,7 @@ cargo build --release
 
 ### Analysis Tools
 
-- **rust_analyzer** - Deep code analysis and diagnostics
+- **rust_analyzer** - Deep code analysis and diagnostics (uses cargo check JSON)
 - **cargo_tree** - Display dependency tree
 - **cargo_doc** - Generate documentation
 
@@ -118,9 +118,18 @@ Built with rmcp 0.6.0, rusty-tools creates isolated Rust environments for each t
 ## Limitations
 
 Current limitations (by design for safety):
-- No `cargo build` or `cargo run` (execution safety)
-- Test discovery only, not execution
+- No `cargo run` (binaries are never executed)
 - Read-only operations on codebases
+
+## Output Format
+
+All tool responses follow a consistent shape:
+
+```jsonc
+{ "status": 0, "success": true, "stdout": "...", "stderr": "", "duration_ms": 123 }
+```
+
+Use `status`/`success` for reliable checks; parse `stdout` for compiler output.
 
 ## Contributing
 

@@ -13,9 +13,11 @@ use serde_json::json;
 use std::borrow::Cow;
 use std::future::Future;
 
-use std::process::Command;
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 #[derive(Clone)]
 struct RustyToolsServer;
@@ -127,7 +129,7 @@ impl ServerHandler for RustyToolsServer {
                 ),
                 Tool::new(
                     Cow::Borrowed("cargo_build"),
-                    Cow::Borrowed("Check if code would build (without actually building)"),
+                    Cow::Borrowed("Build Rust code (produces artifacts)"),
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
@@ -219,8 +221,11 @@ impl ServerHandler for RustyToolsServer {
                     validate_rust_code(code)?;
                     let result = run_rust_tool(code, &["fmt", "--", "--emit=stdout"], None).await?;
                     Ok(CallToolResult::structured(json!({
-                        "formatted": result,
-                        "success": true
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "cargo_clippy" => {
@@ -233,8 +238,11 @@ impl ServerHandler for RustyToolsServer {
                     )
                     .await?;
                     Ok(CallToolResult::structured(json!({
-                        "analysis": result,
-                        "success": result.is_empty()
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "cargo_check" => {
@@ -243,8 +251,11 @@ impl ServerHandler for RustyToolsServer {
                     let result =
                         run_rust_tool(code, &["check"], Some(Duration::from_secs(30))).await?;
                     Ok(CallToolResult::structured(json!({
-                        "output": result,
-                        "success": result.contains("Finished")
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "rustc_explain" => {
@@ -257,7 +268,7 @@ impl ServerHandler for RustyToolsServer {
                             McpError::invalid_params("error_code parameter required", None)
                         })?;
 
-                    let output = Command::new("rustc")
+                    let output = StdCommand::new("rustc")
                         .args(["--explain", error_code])
                         .output()
                         .map_err(|e| {
@@ -275,8 +286,11 @@ impl ServerHandler for RustyToolsServer {
                     }
 
                     Ok(CallToolResult::structured(json!({
-                        "explanation": explanation.trim(),
-                        "success": true
+                        "status": 0,
+                        "success": true,
+                        "stdout": explanation.trim(),
+                        "stderr": "",
+                        "duration_ms": 0
                     })))
                 }
                 "cargo_fix" => {
@@ -289,8 +303,11 @@ impl ServerHandler for RustyToolsServer {
                     )
                     .await?;
                     Ok(CallToolResult::structured(json!({
-                        "output": result,
-                        "success": true
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "cargo_audit" => {
@@ -307,28 +324,45 @@ impl ServerHandler for RustyToolsServer {
                     let result =
                         run_rust_tool(code, &["audit"], Some(Duration::from_secs(30))).await?;
                     Ok(CallToolResult::structured(json!({
-                        "audit": result,
-                        "success": true
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "cargo_test" => {
                     let code = get_code_arg(&request, "cargo_test")?;
                     validate_rust_code(code)?;
-                    let result =
-                        run_rust_tool(code, &["test", "--", "--nocapture"], Some(Duration::from_secs(60))).await?;
+                    let result = run_rust_tool(
+                        code,
+                        &["test", "--", "--nocapture"],
+                        Some(Duration::from_secs(60)),
+                    )
+                    .await?;
                     Ok(CallToolResult::structured(json!({
-                        "test_output": result,
-                        "success": result.contains("test result: ok") || result.contains("0 passed")
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "cargo_build" => {
                     let code = get_code_arg(&request, "cargo_build")?;
                     validate_rust_code(code)?;
-                    let result =
-                        run_rust_tool(code, &["build", "--message-format=short"], Some(Duration::from_secs(45))).await?;
+                    let result = run_rust_tool(
+                        code,
+                        &["build", "--message-format=short"],
+                        Some(Duration::from_secs(45)),
+                    )
+                    .await?;
                     Ok(CallToolResult::structured(json!({
-                        "build_output": result,
-                        "success": result.contains("Finished") || result.contains("Compiling")
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "cargo_search" => {
@@ -341,7 +375,7 @@ impl ServerHandler for RustyToolsServer {
                             McpError::invalid_params("query parameter required", None)
                         })?;
 
-                    let output = Command::new("cargo")
+                    let output = StdCommand::new("cargo")
                         .args(["search", query, "--limit", "10"])
                         .output()
                         .map_err(|e| {
@@ -354,16 +388,12 @@ impl ServerHandler for RustyToolsServer {
                     let results = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
 
-                    if !output.status.success() {
-                        return Ok(CallToolResult::structured(json!({
-                            "error": stderr.trim(),
-                            "success": false
-                        })));
-                    }
-
                     Ok(CallToolResult::structured(json!({
-                        "results": results.trim(),
-                        "success": true
+                        "status": output.status.code().unwrap_or(-1),
+                        "success": output.status.success(),
+                        "stdout": results.trim(),
+                        "stderr": stderr.trim(),
+                        "duration_ms": 0
                     })))
                 }
                 "cargo_tree" => {
@@ -371,8 +401,11 @@ impl ServerHandler for RustyToolsServer {
                     let result =
                         run_rust_tool(code, &["tree"], Some(Duration::from_secs(30))).await?;
                     Ok(CallToolResult::structured(json!({
-                        "tree": result,
-                        "success": true
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "cargo_doc" => {
@@ -382,8 +415,11 @@ impl ServerHandler for RustyToolsServer {
                         run_rust_tool(code, &["doc", "--no-deps"], Some(Duration::from_secs(60)))
                             .await?;
                     Ok(CallToolResult::structured(json!({
-                        "doc_output": result,
-                        "success": result.contains("Documenting")
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 "rust_analyzer" => {
@@ -406,8 +442,11 @@ impl ServerHandler for RustyToolsServer {
                     )
                     .await?;
                     Ok(CallToolResult::structured(json!({
-                        "analysis": result,
-                        "success": true
+                        "status": result.status,
+                        "success": result.status == 0,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "duration_ms": result.duration_ms
                     })))
                 }
                 _ => Err(McpError::method_not_found::<
@@ -451,11 +490,18 @@ fn validate_rust_code(code: &str) -> Result<(), McpError> {
     Ok(())
 }
 
+struct ExecResult {
+    stdout: String,
+    stderr: String,
+    status: i32,
+    duration_ms: u128,
+}
+
 async fn run_rust_tool(
     code: &str,
     args: &[&str],
     timeout: Option<Duration>,
-) -> Result<String, McpError> {
+) -> Result<ExecResult, McpError> {
     // Create a temporary directory for the Rust project
     let temp_dir = tempfile::tempdir()
         .map_err(|e| McpError::internal_error(format!("Failed to create temp dir: {}", e), None))?;
@@ -463,7 +509,7 @@ async fn run_rust_tool(
     let project_path = temp_dir.path();
 
     // Initialize a new Cargo project
-    let output = Command::new("cargo")
+    let output = StdCommand::new("cargo")
         .args(["init", "--name", "temp_project"])
         .current_dir(project_path)
         .output()
@@ -483,59 +529,81 @@ async fn run_rust_tool(
         .map_err(|e| McpError::internal_error(format!("Failed to write code: {}", e), None))?;
 
     // Run the specified cargo command
-    let _start = Instant::now();
+    let start = Instant::now();
     let mut cmd = Command::new("cargo");
     cmd.args(args)
         .current_dir(project_path)
         .env("CARGO_TERM_COLOR", "never");
 
-    let output = if let Some(timeout_duration) = timeout {
-        // Simple timeout implementation
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| McpError::internal_error(format!("Failed to spawn cargo: {}", e), None))?;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| McpError::internal_error(format!("Failed to spawn cargo: {}", e), None))?;
 
-        
+    let mut stdout_reader = child
+        .stdout
+        .take()
+        .ok_or_else(|| McpError::internal_error("Failed to capture stdout", None))?;
+    let mut stderr_reader = child
+        .stderr
+        .take()
+        .ok_or_else(|| McpError::internal_error("Failed to capture stderr", None))?;
 
-        tokio::task::spawn_blocking(move || {
-            let start = Instant::now();
-            loop {
-                if start.elapsed() > timeout_duration {
-                    return Err(McpError::internal_error(
-                        "Command timed out".to_string(),
-                        None,
-                    ));
-                }
+    let out_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stdout_reader.read_to_end(&mut buf).await;
+        buf
+    });
+    let err_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr_reader.read_to_end(&mut buf).await;
+        buf
+    });
 
-                if let Ok(Some(_status)) = child.try_wait() {
-                    return child.wait_with_output().map_err(|e| {
-                        McpError::internal_error(format!("Failed to get output: {}", e), None)
-                    });
-                }
-
-                std::thread::sleep(Duration::from_millis(100));
+    let status = if let Some(dur) = timeout {
+        match tokio::time::timeout(dur, child.wait()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                return Err(McpError::internal_error(
+                    format!("Failed to wait for cargo: {}", e),
+                    None,
+                ));
             }
-        })
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(McpError::internal_error(
+                    "Command timed out".to_string(),
+                    None,
+                ));
+            }
+        }
+    } else {
+        child.wait().await.map_err(|e| {
+            McpError::internal_error(format!("Failed to wait for cargo: {}", e), None)
+        })?
+    };
+
+    let duration_ms = start.elapsed().as_millis();
+
+    let stdout_bytes = out_handle
         .await
-        .map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))??
-    } else {
-        cmd.output()
-            .map_err(|e| McpError::internal_error(format!("Failed to run cargo: {}", e), None))?
-    };
+        .map_err(|e| McpError::internal_error(format!("Stdout task failed: {}", e), None))?;
+    let stderr_bytes = err_handle
+        .await
+        .map_err(|e| McpError::internal_error(format!("Stderr task failed: {}", e), None))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+    let status = status.code().unwrap_or(-1);
 
-    // Combine stdout and stderr for complete output
-    let combined = if stderr.is_empty() {
-        stdout.to_string()
-    } else if stdout.is_empty() {
-        stderr.to_string()
-    } else {
-        format!("{}\n{}", stdout, stderr)
-    };
-
-    Ok(combined)
+    Ok(ExecResult {
+        stdout,
+        stderr,
+        status,
+        duration_ms,
+    })
 }
 
 #[tokio::main]
