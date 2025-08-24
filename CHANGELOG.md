@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2025-08-24
+
+### Added
+- **SQLite Persistence**: Optional storage of tool analyses, errors, and todos
+- **Database Schema**: Tables for analyses, errors, todos, and fixes with proper relationships
+- **Optional --persist flag**: All existing tools now support optional result storage
+- **cargo_history tool**: Query past errors by error code from stored analyses
+- **cargo_todos tool**: Show current todo list from warnings and clippy suggestions
+- **Error Parsing**: Automatic extraction of Rust compiler error codes and messages
+- **Warning Processing**: Automatic todo creation from compiler warnings and clippy suggestions
+- **Backward Compatibility**: All tools work exactly as before when --persist is not used
+
+### Changed
+- Tool schemas now include optional "persist" boolean parameter (defaults to false)
+- RustyToolsServer now optionally initializes SQLite database (rusty-tools.db)
+- Enhanced error handling with graceful degradation when database is unavailable
+
+### Technical Details
+- Uses rusqlite with bundled SQLite for zero external dependencies
+- Database automatically created with proper schema on first run
+- Thread-safe database access using Arc<Mutex<Database>>
+- Structured error parsing for E-codes and compiler messages
+- Clippy warning detection and todo extraction
+
 ## [0.2.0] - 2025-08-24
 
 Changed

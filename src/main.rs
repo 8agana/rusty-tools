@@ -14,13 +14,117 @@ use std::borrow::Cow;
 use std::future::Future;
 
 use std::process::Command as StdCommand;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+mod database;
+
+use database::Database;
+
+#[derive(Debug)]
+struct ErrorInfo {
+    code: Option<String>,
+    message: String,
+    file: Option<String>,
+    line: Option<i32>,
+    suggestion: Option<String>,
+}
+
 #[derive(Clone)]
-struct RustyToolsServer;
+struct RustyToolsServer {
+    db: Option<Arc<Mutex<Database>>>,
+}
+
+impl RustyToolsServer {
+    fn new() -> Self {
+        // Try to initialize database, but don't fail if it can't be created
+        let db = match Database::new(None) {
+            Ok(db) => Some(Arc::new(Mutex::new(db))),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Could not initialize database: {}. Persistence will be disabled.",
+                    e
+                );
+                None
+            }
+        };
+
+        RustyToolsServer { db }
+    }
+
+    fn get_persist_flag(request: &CallToolRequestParam) -> bool {
+        request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("persist"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    fn parse_and_store_errors(db: &Database, analysis_id: i64, stderr: &str) {
+        // Parse Rust compiler errors from stderr
+        // Look for patterns like "error[E0308]:" and "warning:"
+        for line in stderr.lines() {
+            if line.contains("error[") {
+                if let Some(error_info) = Self::parse_rust_error_line(line) {
+                    let _ = db.store_error(
+                        analysis_id,
+                        error_info.code.as_deref(),
+                        &error_info.message,
+                        error_info.file.as_deref(),
+                        error_info.line,
+                        error_info.suggestion.as_deref(),
+                    );
+                }
+            } else if line.contains("warning:") {
+                // Store warnings as todos
+                let warning_msg = line.trim_start_matches("warning:").trim();
+                if !warning_msg.is_empty() {
+                    let _ = db.store_todo("compiler_warning", warning_msg, None, None);
+                }
+            }
+        }
+    }
+
+    fn parse_rust_error_line(line: &str) -> Option<ErrorInfo> {
+        // Parse a line like: "error[E0308]: mismatched types"
+        if let Some(error_start) = line.find("error[") {
+            let error_part = &line[error_start..];
+            if let Some(bracket_end) = error_part.find(']') {
+                let code = error_part[6..bracket_end].to_string(); // Skip "error["
+                if let Some(colon_pos) = error_part.find(": ") {
+                    let message = error_part[colon_pos + 2..].trim().to_string();
+                    return Some(ErrorInfo {
+                        code: Some(code),
+                        message,
+                        file: None,
+                        line: None,
+                        suggestion: None,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn parse_and_store_clippy_todos(db: &Database, stderr: &str) {
+        // Parse clippy warnings and store as todos
+        for line in stderr.lines() {
+            if line.contains("warning:") && (line.contains("clippy::") || line.contains("help:")) {
+                let warning_msg = if line.contains("help:") {
+                    line.trim_start_matches("help:").trim()
+                } else {
+                    line.trim_start_matches("warning:").trim()
+                };
+                if !warning_msg.is_empty() {
+                    let _ = db.store_todo("clippy", warning_msg, None, None);
+                }
+            }
+        }
+    }
+}
 
 impl ServerHandler for RustyToolsServer {
     fn get_info(&self) -> ServerInfo {
@@ -56,7 +160,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code to format"}
+                            "code": {"type": "string", "description": "Rust code to format"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -67,7 +172,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code to analyze"}
+                            "code": {"type": "string", "description": "Rust code to analyze"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -78,7 +184,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code to check"}
+                            "code": {"type": "string", "description": "Rust code to check"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -100,7 +207,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code to fix"}
+                            "code": {"type": "string", "description": "Rust code to fix"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -111,7 +219,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code with Cargo.toml to audit"}
+                            "code": {"type": "string", "description": "Rust code with Cargo.toml to audit"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -122,7 +231,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code with tests to run"}
+                            "code": {"type": "string", "description": "Rust code with tests to run"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -133,7 +243,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code to build-check"}
+                            "code": {"type": "string", "description": "Rust code to build-check"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -155,7 +266,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code with dependencies to analyze"}
+                            "code": {"type": "string", "description": "Rust code with dependencies to analyze"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -166,7 +278,8 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code to generate documentation for"}
+                            "code": {"type": "string", "description": "Rust code to generate documentation for"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
                     })),
@@ -179,9 +292,33 @@ impl ServerHandler for RustyToolsServer {
                     Arc::new(rmcp::object!({
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Rust code to analyze"}
+                            "code": {"type": "string", "description": "Rust code to analyze"},
+                            "persist": {"type": "boolean", "description": "Store results in SQLite database", "default": false}
                         },
                         "required": ["code"]
+                    })),
+                ),
+                Tool::new(
+                    Cow::Borrowed("cargo_history"),
+                    Cow::Borrowed("Query past errors by error code from stored analyses"),
+                    Arc::new(rmcp::object!({
+                        "type": "object",
+                        "properties": {
+                            "error_code": {"type": "string", "description": "Specific error code to search for (optional)"},
+                            "limit": {"type": "number", "description": "Maximum number of results to return", "default": 10}
+                        },
+                        "required": []
+                    })),
+                ),
+                Tool::new(
+                    Cow::Borrowed("cargo_todos"),
+                    Cow::Borrowed("Show current todo list from warnings and clippy suggestions"),
+                    Arc::new(rmcp::object!({
+                        "type": "object",
+                        "properties": {
+                            "show_completed": {"type": "boolean", "description": "Include completed todos", "default": false}
+                        },
+                        "required": []
                     })),
                 ),
             ];
@@ -230,6 +367,7 @@ impl ServerHandler for RustyToolsServer {
                 }
                 "cargo_clippy" => {
                     let code = get_code_arg(&request, "cargo_clippy")?;
+                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
                     let result = run_rust_tool(
                         code,
@@ -237,26 +375,66 @@ impl ServerHandler for RustyToolsServer {
                         Some(Duration::from_secs(30)),
                     )
                     .await?;
-                    Ok(CallToolResult::structured(json!({
+
+                    let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
                         "stdout": result.stdout,
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
-                    })))
+                    });
+
+                    // Store analysis if persist flag is enabled
+                    if persist {
+                        if let Some(ref db) = self.db {
+                            if let Ok(db) = db.lock() {
+                                if let Ok(analysis_id) = db.store_analysis(
+                                    "cargo_clippy",
+                                    &json_result,
+                                    result.status == 0,
+                                    None,
+                                ) {
+                                    Self::parse_and_store_errors(&db, analysis_id, &result.stderr);
+                                    Self::parse_and_store_clippy_todos(&db, &result.stderr);
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(CallToolResult::structured(json_result))
                 }
                 "cargo_check" => {
                     let code = get_code_arg(&request, "cargo_check")?;
+                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
                     let result =
                         run_rust_tool(code, &["check"], Some(Duration::from_secs(30))).await?;
-                    Ok(CallToolResult::structured(json!({
+
+                    let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
                         "stdout": result.stdout,
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
-                    })))
+                    });
+
+                    // Store analysis if persist flag is enabled
+                    if persist {
+                        if let Some(ref db) = self.db {
+                            if let Ok(db) = db.lock() {
+                                if let Ok(analysis_id) = db.store_analysis(
+                                    "cargo_check",
+                                    &json_result,
+                                    result.status == 0,
+                                    None,
+                                ) {
+                                    Self::parse_and_store_errors(&db, analysis_id, &result.stderr);
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(CallToolResult::structured(json_result))
                 }
                 "rustc_explain" => {
                     let error_code = request
@@ -424,6 +602,7 @@ impl ServerHandler for RustyToolsServer {
                 }
                 "rust_analyzer" => {
                     let code = get_code_arg(&request, "rust_analyzer")?;
+                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
 
                     // Check if rust-analyzer is installed
@@ -441,13 +620,135 @@ impl ServerHandler for RustyToolsServer {
                         Some(Duration::from_secs(30)),
                     )
                     .await?;
-                    Ok(CallToolResult::structured(json!({
+
+                    let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
                         "stdout": result.stdout,
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
-                    })))
+                    });
+
+                    // Store analysis if persist flag is enabled
+                    if persist {
+                        if let Some(ref db) = self.db {
+                            if let Ok(db) = db.lock() {
+                                let _ = db.store_analysis(
+                                    "rust_analyzer",
+                                    &json_result,
+                                    result.status == 0,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+
+                    Ok(CallToolResult::structured(json_result))
+                }
+                "cargo_history" => {
+                    let error_code = request
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("error_code"))
+                        .and_then(|v| v.as_str());
+
+                    let limit = request
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("limit"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize);
+
+                    match &self.db {
+                        Some(db) => match db.lock() {
+                            Ok(db) => match db.get_error_history(error_code, limit) {
+                                Ok(errors) => {
+                                    let error_json: Vec<_> = errors
+                                        .iter()
+                                        .map(|e| {
+                                            json!({
+                                                "id": e.id,
+                                                "error_code": e.error_code,
+                                                "message": e.message,
+                                                "file": e.file,
+                                                "line": e.line,
+                                                "suggestion": e.suggestion,
+                                                "timestamp": e.timestamp,
+                                                "tool": e.tool
+                                            })
+                                        })
+                                        .collect();
+
+                                    Ok(CallToolResult::structured(json!({
+                                        "success": true,
+                                        "count": error_json.len(),
+                                        "errors": error_json
+                                    })))
+                                }
+                                Err(e) => Ok(CallToolResult::structured(json!({
+                                    "success": false,
+                                    "error": format!("Database query failed: {}", e)
+                                }))),
+                            },
+                            Err(e) => Ok(CallToolResult::structured(json!({
+                                "success": false,
+                                "error": format!("Could not access database: {}", e)
+                            }))),
+                        },
+                        None => Ok(CallToolResult::structured(json!({
+                            "success": false,
+                            "error": "Database not initialized. No historical data available."
+                        }))),
+                    }
+                }
+                "cargo_todos" => {
+                    let show_completed = request
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("show_completed"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    match &self.db {
+                        Some(db) => match db.lock() {
+                            Ok(db) => match db.get_todos(show_completed) {
+                                Ok(todos) => {
+                                    let todo_json: Vec<_> = todos
+                                        .iter()
+                                        .map(|t| {
+                                            json!({
+                                                "id": t.id,
+                                                "source": t.source,
+                                                "description": t.description,
+                                                "file_path": t.file_path,
+                                                "line_number": t.line_number,
+                                                "completed": t.completed,
+                                                "created_at": t.created_at
+                                            })
+                                        })
+                                        .collect();
+
+                                    Ok(CallToolResult::structured(json!({
+                                        "success": true,
+                                        "count": todo_json.len(),
+                                        "todos": todo_json
+                                    })))
+                                }
+                                Err(e) => Ok(CallToolResult::structured(json!({
+                                    "success": false,
+                                    "error": format!("Database query failed: {}", e)
+                                }))),
+                            },
+                            Err(e) => Ok(CallToolResult::structured(json!({
+                                "success": false,
+                                "error": format!("Could not access database: {}", e)
+                            }))),
+                        },
+                        None => Ok(CallToolResult::structured(json!({
+                            "success": false,
+                            "error": "Database not initialized. No todo data available."
+                        }))),
+                    }
                 }
                 _ => Err(McpError::method_not_found::<
                     rmcp::model::CallToolRequestMethod,
@@ -611,7 +912,7 @@ async fn main() -> Result<()> {
     // Log server start to stderr (won't interfere with MCP protocol)
     eprintln!("Rusty Tools MCP Server starting...");
 
-    let handler = RustyToolsServer;
+    let handler = RustyToolsServer::new();
     let service = handler
         .serve(stdio())
         .await
