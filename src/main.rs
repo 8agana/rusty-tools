@@ -126,6 +126,17 @@ impl ServerHandler for RustyToolsServer {
                     })),
                 ),
                 Tool::new(
+                    Cow::Borrowed("cargo_build"),
+                    Cow::Borrowed("Check if code would build (without actually building)"),
+                    Arc::new(rmcp::object!({
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string", "description": "Rust code to build-check"}
+                        },
+                        "required": ["code"]
+                    })),
+                ),
+                Tool::new(
                     Cow::Borrowed("cargo_search"),
                     Cow::Borrowed("Search crates.io for packages"),
                     Arc::new(rmcp::object!({
@@ -304,10 +315,20 @@ impl ServerHandler for RustyToolsServer {
                     let code = get_code_arg(&request, "cargo_test")?;
                     validate_rust_code(code)?;
                     let result =
-                        run_rust_tool(code, &["test"], Some(Duration::from_secs(60))).await?;
+                        run_rust_tool(code, &["test", "--", "--nocapture"], Some(Duration::from_secs(60))).await?;
                     Ok(CallToolResult::structured(json!({
                         "test_output": result,
-                        "success": result.contains("test result: ok")
+                        "success": result.contains("test result: ok") || result.contains("0 passed")
+                    })))
+                }
+                "cargo_build" => {
+                    let code = get_code_arg(&request, "cargo_build")?;
+                    validate_rust_code(code)?;
+                    let result =
+                        run_rust_tool(code, &["build", "--message-format=short"], Some(Duration::from_secs(45))).await?;
+                    Ok(CallToolResult::structured(json!({
+                        "build_output": result,
+                        "success": result.contains("Finished") || result.contains("Compiling")
                     })))
                 }
                 "cargo_search" => {

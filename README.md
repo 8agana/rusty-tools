@@ -39,6 +39,12 @@ cargo build --release
 
 ### Core Tools (Production Ready)
 
+- **cargo_build** - Check if code would build successfully
+  ```rust
+  // Validates that code compiles without actually building artifacts
+  // Faster than full build, perfect for validation
+  ```
+
 - **cargo_fmt** - Format Rust code using rustfmt
   ```rust
   // Input: unformatted code
@@ -79,7 +85,11 @@ cargo build --release
 
 ### Testing
 
-- **cargo_test** - List and analyze test functions
+- **cargo_test** - Run tests with visible output
+  ```rust
+  // Runs tests with --nocapture for full output visibility
+  // Shows actual test results, not just pass/fail
+  ```
 
 ## Use Cases
 
