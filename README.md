@@ -1,5 +1,8 @@
 # rusty-tools
 
+[![Release](https://img.shields.io/github/v/release/8agana/rusty-tools?display_name=tag&sort=semver)](https://github.com/8agana/rusty-tools/releases/latest)
+[Latest tag](https://github.com/8agana/rusty-tools/releases/latest)
+
 MCP (Model Context Protocol) server providing Rust development tools for AI assistants. Bridges the gap between AI code generation and Rust compiler validation.
 
 ## Why rusty-tools?
