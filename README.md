@@ -35,6 +35,27 @@ cd rusty-tools
 cargo build --release
 ```
 
+## Releases
+
+Download prebuilt binaries from GitHub Releases and verify the checksum.
+
+```bash
+# Download latest binary and checksum
+curl -L -o rusty-tools \
+  https://github.com/8agana/rusty-tools/releases/latest/download/rusty-tools
+curl -L -o rusty-tools-SHA256.txt \
+  https://github.com/8agana/rusty-tools/releases/latest/download/rusty-tools-SHA256.txt
+
+# Verify checksum (macOS)
+shasum -a 256 -c rusty-tools-SHA256.txt
+
+# Make executable and install
+chmod +x rusty-tools
+sudo mv rusty-tools /usr/local/bin/
+```
+
+Then point your MCP client (e.g., Claude Desktop) to `/usr/local/bin/rusty-tools`.
+
 ## Available Tools
 
 ### Core Tools (Production Ready)
