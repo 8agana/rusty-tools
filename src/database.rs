@@ -50,7 +50,7 @@ impl Database {
             [],
         )?;
 
-        // Create todos table
+        // Create todos table - fix column type issues
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS todos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +59,7 @@ impl Database {
                 description TEXT NOT NULL,
                 file_path TEXT,
                 line_number INTEGER,
-                completed BOOLEAN DEFAULT 0
+                completed INTEGER DEFAULT 0
             )",
             [],
         )?;
@@ -71,11 +71,17 @@ impl Database {
                 error_id INTEGER,
                 fix_applied TEXT NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                worked BOOLEAN,
+                worked INTEGER,
                 FOREIGN KEY (error_id) REFERENCES errors (id)
             )",
             [],
         )?;
+
+        // Add timestamp column to existing errors table if it doesn't exist
+        let _ = self.conn.execute(
+            "ALTER TABLE errors ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP",
+            [],
+        );
 
         Ok(())
     }
@@ -152,22 +158,39 @@ impl Database {
 
         let mut errors = Vec::new();
 
+        // Check if timestamp column exists in errors table
+        let has_timestamp = self
+            .conn
+            .prepare("SELECT timestamp FROM errors LIMIT 1")
+            .is_ok();
+
         if let Some(code) = error_code {
-            let sql = "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion, a.timestamp, a.tool 
-                       FROM errors e 
-                       JOIN analyses a ON e.analysis_id = a.id 
-                       WHERE e.error_code = ?1 
-                       ORDER BY a.timestamp DESC 
-                       LIMIT ?2";
+            let sql = if has_timestamp {
+                "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion,
+                        COALESCE(e.timestamp, a.timestamp) as timestamp, a.tool
+                 FROM errors e
+                 JOIN analyses a ON e.analysis_id = a.id
+                 WHERE e.error_code = ?1
+                 ORDER BY COALESCE(e.timestamp, a.timestamp) DESC
+                 LIMIT ?2"
+            } else {
+                "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion,
+                        a.timestamp, a.tool
+                 FROM errors e
+                 JOIN analyses a ON e.analysis_id = a.id
+                 WHERE e.error_code = ?1
+                 ORDER BY a.timestamp DESC
+                 LIMIT ?2"
+            };
             let mut stmt = self.conn.prepare(sql)?;
             let error_iter = stmt.query_map(params![code, limit], |row| {
                 Ok(ErrorRecord {
                     id: row.get(0)?,
-                    error_code: row.get(1)?,
+                    error_code: row.get::<_, Option<String>>(1)?,
                     message: row.get(2)?,
-                    file: row.get(3)?,
-                    line: row.get(4)?,
-                    suggestion: row.get(5)?,
+                    file: row.get::<_, Option<String>>(3)?,
+                    line: row.get::<_, Option<i32>>(4)?,
+                    suggestion: row.get::<_, Option<String>>(5)?,
                     timestamp: row.get(6)?,
                     tool: row.get(7)?,
                 })
@@ -177,20 +200,30 @@ impl Database {
                 errors.push(error?);
             }
         } else {
-            let sql = "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion, a.timestamp, a.tool 
-                       FROM errors e 
-                       JOIN analyses a ON e.analysis_id = a.id 
-                       ORDER BY a.timestamp DESC 
-                       LIMIT ?1";
+            let sql = if has_timestamp {
+                "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion,
+                        COALESCE(e.timestamp, a.timestamp) as timestamp, a.tool
+                 FROM errors e
+                 JOIN analyses a ON e.analysis_id = a.id
+                 ORDER BY COALESCE(e.timestamp, a.timestamp) DESC
+                 LIMIT ?1"
+            } else {
+                "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion,
+                        a.timestamp, a.tool
+                 FROM errors e
+                 JOIN analyses a ON e.analysis_id = a.id
+                 ORDER BY a.timestamp DESC
+                 LIMIT ?1"
+            };
             let mut stmt = self.conn.prepare(sql)?;
             let error_iter = stmt.query_map(params![limit], |row| {
                 Ok(ErrorRecord {
                     id: row.get(0)?,
-                    error_code: row.get(1)?,
+                    error_code: row.get::<_, Option<String>>(1)?,
                     message: row.get(2)?,
-                    file: row.get(3)?,
-                    line: row.get(4)?,
-                    suggestion: row.get(5)?,
+                    file: row.get::<_, Option<String>>(3)?,
+                    line: row.get::<_, Option<i32>>(4)?,
+                    suggestion: row.get::<_, Option<String>>(5)?,
                     timestamp: row.get(6)?,
                     tool: row.get(7)?,
                 })
@@ -206,25 +239,37 @@ impl Database {
 
     pub fn get_todos(&self, show_completed: bool) -> Result<Vec<TodoRecord>> {
         let sql = if show_completed {
-            "SELECT id, source, description, file_path, line_number, completed, created_at 
-             FROM todos 
+            "SELECT id, source, description, file_path,
+                    CAST(line_number AS INTEGER) as line_number,
+                    completed, created_at
+             FROM todos
              ORDER BY created_at DESC"
         } else {
-            "SELECT id, source, description, file_path, line_number, completed, created_at 
-             FROM todos 
-             WHERE completed = 0 
+            "SELECT id, source, description, file_path,
+                    CAST(line_number AS INTEGER) as line_number,
+                    completed, created_at
+             FROM todos
+             WHERE completed = 0
              ORDER BY created_at DESC"
         };
 
         let mut stmt = self.conn.prepare(sql)?;
         let todo_iter = stmt.query_map([], |row| {
+            // Handle line_number more carefully to avoid type issues
+            let line_number: Option<i32> = match row.get::<_, Option<rusqlite::types::Value>>(4)? {
+                Some(rusqlite::types::Value::Integer(i)) => Some(i as i32),
+                Some(rusqlite::types::Value::Text(s)) => s.parse().ok(),
+                Some(rusqlite::types::Value::Null) | None => None,
+                _ => None,
+            };
+
             Ok(TodoRecord {
                 id: row.get(0)?,
                 source: row.get(1)?,
                 description: row.get(2)?,
-                file_path: row.get(3)?,
-                line_number: row.get(4)?,
-                completed: row.get(5)?,
+                file_path: row.get::<_, Option<String>>(3)?,
+                line_number,
+                completed: row.get::<_, i32>(5)? != 0, // Convert INTEGER to bool
                 created_at: row.get(6)?,
             })
         })?;
@@ -236,12 +281,71 @@ impl Database {
         Ok(todos)
     }
 
+    #[allow(dead_code)]
     pub fn mark_todo_completed(&self, todo_id: i64) -> Result<()> {
         use rusqlite::params;
         self.conn.execute(
             "UPDATE todos SET completed = 1 WHERE id = ?1",
             params![todo_id],
         )?;
+        Ok(())
+    }
+
+    /// Get statistics about stored data
+    pub fn get_stats(&self) -> Result<DatabaseStats> {
+        let analyses_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM analyses", [], |row| row.get(0))?;
+
+        let errors_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM errors", [], |row| row.get(0))?;
+
+        let todos_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM todos WHERE completed = 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let completed_todos_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM todos WHERE completed = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(DatabaseStats {
+            total_analyses: analyses_count as usize,
+            total_errors: errors_count as usize,
+            active_todos: todos_count as usize,
+            completed_todos: completed_todos_count as usize,
+        })
+    }
+
+    /// Clean up old data beyond a certain limit
+    #[allow(dead_code)]
+    pub fn cleanup_old_data(&self, keep_analyses: usize) -> Result<()> {
+        use rusqlite::params;
+
+        // Delete old analyses and their associated errors
+        self.conn.execute(
+            "DELETE FROM errors WHERE analysis_id IN (
+                SELECT id FROM analyses
+                ORDER BY timestamp DESC
+                LIMIT -1 OFFSET ?1
+            )",
+            params![keep_analyses],
+        )?;
+
+        self.conn.execute(
+            "DELETE FROM analyses
+             WHERE id NOT IN (
+                SELECT id FROM analyses
+                ORDER BY timestamp DESC
+                LIMIT ?1
+             )",
+            params![keep_analyses],
+        )?;
+
         Ok(())
     }
 }
@@ -267,4 +371,12 @@ pub struct TodoRecord {
     pub line_number: Option<i32>,
     pub completed: bool,
     pub created_at: String,
+}
+
+#[derive(Debug)]
+pub struct DatabaseStats {
+    pub total_analyses: usize,
+    pub total_errors: usize,
+    pub active_todos: usize,
+    pub completed_todos: usize,
 }
