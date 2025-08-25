@@ -633,12 +633,14 @@ impl ServerHandler for RustyToolsServer {
                     if persist {
                         if let Some(ref db) = self.db {
                             if let Ok(db) = db.lock() {
-                                let _ = db.store_analysis(
+                                if let Ok(analysis_id) = db.store_analysis(
                                     "rust_analyzer",
                                     &json_result,
                                     result.status == 0,
                                     None,
-                                );
+                                ) {
+                                    Self::parse_and_store_errors(&db, analysis_id, &result.stderr);
+                                }
                             }
                         }
                     }

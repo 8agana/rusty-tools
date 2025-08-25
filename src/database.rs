@@ -87,16 +87,12 @@ impl Database {
         success: bool,
         file_path: Option<&str>,
     ) -> Result<i64> {
+        use rusqlite::params;
         let full_output_str = full_output.to_string();
 
         self.conn.execute(
             "INSERT INTO analyses (tool, full_output, success, file_path) VALUES (?1, ?2, ?3, ?4)",
-            [
-                tool,
-                &full_output_str,
-                &success.to_string(),
-                file_path.unwrap_or(""),
-            ],
+            params![tool, full_output_str, success, file_path],
         )?;
 
         Ok(self.conn.last_insert_rowid())
@@ -111,15 +107,16 @@ impl Database {
         line: Option<i32>,
         suggestion: Option<&str>,
     ) -> Result<()> {
+        use rusqlite::params;
         self.conn.execute(
             "INSERT INTO errors (analysis_id, error_code, message, file, line, suggestion) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            [
-                &analysis_id.to_string(),
-                error_code.unwrap_or(""),
+            params![
+                analysis_id,
+                error_code,
                 message,
-                file.unwrap_or(""),
-                &line.map(|l| l.to_string()).unwrap_or_default(),
-                suggestion.unwrap_or("")
+                file,
+                line,
+                suggestion
             ]
         )?;
         Ok(())
@@ -132,13 +129,14 @@ impl Database {
         file_path: Option<&str>,
         line_number: Option<i32>,
     ) -> Result<()> {
+        use rusqlite::params;
         self.conn.execute(
             "INSERT INTO todos (source, description, file_path, line_number) VALUES (?1, ?2, ?3, ?4)",
-            [
+            params![
                 source,
                 description,
-                file_path.unwrap_or(""),
-                &line_number.map(|l| l.to_string()).unwrap_or_default()
+                file_path,
+                line_number
             ]
         )?;
         Ok(())
@@ -149,7 +147,8 @@ impl Database {
         error_code: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<ErrorRecord>> {
-        let limit = limit.unwrap_or(10);
+        use rusqlite::params;
+        let limit = limit.unwrap_or(10) as i64;
 
         let mut errors = Vec::new();
 
@@ -161,7 +160,7 @@ impl Database {
                        ORDER BY a.timestamp DESC 
                        LIMIT ?2";
             let mut stmt = self.conn.prepare(sql)?;
-            let error_iter = stmt.query_map([code, &limit.to_string()], |row| {
+            let error_iter = stmt.query_map(params![code, limit], |row| {
                 Ok(ErrorRecord {
                     id: row.get(0)?,
                     error_code: row.get(1)?,
@@ -184,7 +183,7 @@ impl Database {
                        ORDER BY a.timestamp DESC 
                        LIMIT ?1";
             let mut stmt = self.conn.prepare(sql)?;
-            let error_iter = stmt.query_map([&limit.to_string()], |row| {
+            let error_iter = stmt.query_map(params![limit], |row| {
                 Ok(ErrorRecord {
                     id: row.get(0)?,
                     error_code: row.get(1)?,
@@ -238,9 +237,10 @@ impl Database {
     }
 
     pub fn mark_todo_completed(&self, todo_id: i64) -> Result<()> {
+        use rusqlite::params;
         self.conn.execute(
             "UPDATE todos SET completed = 1 WHERE id = ?1",
-            [&todo_id.to_string()],
+            params![todo_id],
         )?;
         Ok(())
     }

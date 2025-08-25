@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2025-08-25
+
+### Fixed
+- **Database Type Mismatches**: Fixed "Invalid column type Text" errors by using proper parameter binding instead of string conversion for INTEGER columns (line_number and line fields)
+- **Missing Error Parsing**: Added error parsing to rust_analyzer tool so errors are properly stored when --persist=true
+- **SQLite Parameter Binding**: Replaced manual string conversion with rusqlite::params! macro for all database operations
+- **Database Query Issues**: Fixed parameter type mismatches in get_error_history and other query methods
+
+### Technical Details
+- All database insert and update operations now use proper rusqlite parameter binding
+- Option<i32> values (line numbers) are correctly handled as INTEGER types in SQLite
+- Error parsing is now consistent across cargo_check, cargo_clippy, and rust_analyzer tools
+- Improved database operation reliability and type safety
+
 ## [0.3.0] - 2025-08-24
 
 ### Added
