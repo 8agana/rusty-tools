@@ -1,0 +1,10 @@
+[package]
+name = "rusty-tools-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+rmcp = { version = "0.6.4", features = ["transport-io"] }
+rusty-tools-core = { path = "../core" }
+tokio = { version = "1", features = ["full"] }

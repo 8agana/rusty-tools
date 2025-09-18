@@ -24,7 +24,7 @@ Add to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "rusty-tools": {
-      "command": "/path/to/rusty-tools/target/release/rusty-tools"
+      "command": "/path/to/rusty-tools/target/release/rusty-tools-server"
     }
   }
 }
@@ -35,7 +35,7 @@ Add to your `claude_desktop_config.json`:
 ```bash
 git clone https://github.com/8agana/rusty-tools.git
 cd rusty-tools
-cargo build --release
+cargo build --release --bin rusty-tools-server
 ```
 
 ## Releases
@@ -44,20 +44,20 @@ Download prebuilt binaries from GitHub Releases and verify the checksum.
 
 ```bash
 # Download latest binary and checksum
-curl -L -o rusty-tools \
-  https://github.com/8agana/rusty-tools/releases/latest/download/rusty-tools
-curl -L -o rusty-tools-SHA256.txt \
-  https://github.com/8agana/rusty-tools/releases/latest/download/rusty-tools-SHA256.txt
+curl -L -o rusty-tools-server \
+  https://github.com/8agana/rusty-tools/releases/latest/download/rusty-tools-server
+curl -L -o rusty-tools-server-SHA256.txt \
+  https://github.com/8agana/rusty-tools/releases/latest/download/rusty-tools-server-SHA256.txt
 
 # Verify checksum (macOS)
-shasum -a 256 -c rusty-tools-SHA256.txt
+shasum -a 256 -c rusty-tools-server-SHA256.txt
 
 # Make executable and install
-chmod +x rusty-tools
-sudo mv rusty-tools /usr/local/bin/
+chmod +x rusty-tools-server
+sudo mv rusty-tools-server /usr/local/bin/
 ```
 
-Then point your MCP client (e.g., Claude Desktop) to `/usr/local/bin/rusty-tools`.
+Then point your MCP client (e.g., Claude Desktop) to `/usr/local/bin/rusty-tools-server`.
 
 ## Available Tools
 
@@ -134,7 +134,7 @@ Then point your MCP client (e.g., Claude Desktop) to `/usr/local/bin/rusty-tools
 
 ## Architecture
 
-Built with rmcp 0.6.0, rusty-tools creates isolated Rust environments for each tool invocation, ensuring:
+Built with rmcp 0.6.4, rusty-tools creates isolated Rust environments for each tool invocation, ensuring:
 - No persistent state between calls
 - Safe execution without side effects
 - Fast response times

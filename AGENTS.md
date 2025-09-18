@@ -1,19 +1,20 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Root: `Cargo.toml` (deps, edition 2024), `Cargo.lock`, `README.md`.
-- Source: `src/main.rs` — MCP server entrypoint built on `rmcp`.
+- Root: `Cargo.toml` (workspace), `Cargo.lock`, `README.md`.
+- Core library: `core/src/lib.rs` — shared database and server logic.
+- Server binary: `server/src/main.rs` — MCP server entrypoint built on `rmcp`.
 - Build output: `target/` (ignored).
 - Scripts: `test-server.sh` for JSON-RPC smoke tests.
 - Tests: none yet; add unit tests in modules and integration tests in `tests/`.
 
 ## Build, Test, and Development Commands
-- `cargo build` / `cargo build --release`: compile debug/release binaries.
+- `cargo build --bin rusty-tools-server` / `cargo build --release --bin rusty-tools-server`: compile debug/release binaries.
 - `cargo check`: fast type-check without producing artifacts.
 - `cargo fmt --all`: format the entire workspace with rustfmt.
 - `cargo clippy --all-targets -- -D warnings`: lint; treat warnings as errors locally.
 - `cargo test`: run unit/integration tests.
-- `./target/release/rusty-tools`: run the MCP server binary.
+- `./target/release/rusty-tools-server`: run the MCP server binary.
 - `./test-server.sh`: send initialize/tools requests to the server for smoke testing.
 
 ## Coding Style & Naming Conventions
@@ -24,10 +25,10 @@
 
 ## Testing Guidelines
 - Framework: built-in Rust test harness via `cargo test`.
-- Layout: unit tests under `#[cfg(test)]` in `src/`; integration tests in `tests/` (e.g., `tests/mcp_smoke.rs`).
+- Layout: unit tests under `#[cfg(test)]` in `core/src/` and `server/src/`; integration tests in `tests/` (e.g., `tests/mcp_smoke.rs`).
 - Conventions: descriptive test names, arrange/act/assert structure, avoid external network.
 - Coverage: no strict threshold; cover critical paths (tool routing, error handling, timeouts).
-- Server smoke test: `./test-server.sh` (expects `target/release/rusty-tools`).
+- Server smoke test: `./test-server.sh` (expects `target/release/rusty-tools-server`).
 
 ## Commit & Pull Request Guidelines
 - Commits: use Conventional Commit style when possible.

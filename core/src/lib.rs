@@ -1,29 +1,33 @@
 use anyhow::Result;
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
+    ErrorData as McpError, ServerHandler,
     model::{
         CallToolRequestParam, CallToolResult, InitializeRequestParam, InitializeResult,
         ListResourcesResult, ListToolsResult, PaginatedRequestParam, Resource, ServerCapabilities,
         ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
-    transport::stdio,
 };
-use serde_json::json;
+use rusqlite::Connection;
+use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::future::Future;
+use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-mod database;
-
-use database::Database;
+#[derive(Debug, Clone)]
+pub enum PersistenceMode {
+    Disabled,
+    Path(PathBuf),
+}
 
 #[derive(Debug, Clone)]
-struct ErrorInfo {
+pub struct ErrorInfo {
     code: Option<String>,
     message: String,
     file: Option<String>,
@@ -32,23 +36,24 @@ struct ErrorInfo {
 }
 
 #[derive(Clone)]
-struct RustyToolsServer {
+pub struct RustyToolsServer {
     db: Option<Arc<Mutex<Database>>>,
 }
 
 impl RustyToolsServer {
-    fn new() -> Self {
-        // Try to initialize database, but don't fail if it can't be created
-        let db = match Database::new(None) {
-            Ok(db) => {
-                eprintln!("✅ Database initialized successfully");
+    pub fn new(mode: PersistenceMode) -> Self {
+        let db = match Database::new(mode.clone()) {
+            Ok(Some(db)) => {
+                match mode {
+                    PersistenceMode::Path(path) => {
+                        eprintln!("✅ Database initialized at: {}", path.display());
+                    }
+                    PersistenceMode::Disabled => {}
+                }
                 Some(Arc::new(Mutex::new(db)))
             }
-            Err(e) => {
-                eprintln!(
-                    "⚠️  Warning: Could not initialize database: {}. Persistence will be disabled.",
-                    e
-                );
+            _ => {
+                eprintln!("⚠️  Warning: Could not initialize database: Persistence disabled.");
                 None
             }
         };
@@ -277,10 +282,6 @@ impl RustyToolsServer {
                     Self::parse_and_store_clippy_todos(&db, &result.stderr);
                 }
 
-                eprintln!(
-                    "✅ Analysis {} stored successfully for {}",
-                    analysis_id, tool
-                );
                 Ok(())
             }
             Err(e) => Err(format!("Failed to store analysis: {}", e)),
@@ -544,20 +545,27 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-                    eprintln!("✅ cargo_fmt completed with status: {}", result.status);
-                    Ok(CallToolResult::structured(json_result))
+                    let persist = Self::get_persist_flag(&request);
+                    if let Err(e) = self.store_analysis_with_errors("cargo_fmt", &result, persist) {
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
+                    }
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "cargo_clippy" => {
+                    eprintln!("🔧 Executing cargo_clippy");
                     let code = get_code_arg(&request, "cargo_clippy")?;
-                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
                     let result = run_rust_tool(
                         code,
-                        &["clippy", "--", "-W", "clippy::all"],
+                        &["clippy", "--", "-D", "warnings"],
                         Some(Duration::from_secs(30)),
                     )
                     .await?;
-
                     let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
@@ -565,23 +573,25 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-
-                    // Store analysis if requested
+                    let persist = Self::get_persist_flag(&request);
                     if let Err(e) =
                         self.store_analysis_with_errors("cargo_clippy", &result, persist)
                     {
-                        eprintln!("Persistence error: {}", e);
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
                     }
-
-                    Ok(CallToolResult::structured(json_result))
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "cargo_check" => {
+                    eprintln!("🔧 Executing cargo_check");
                     let code = get_code_arg(&request, "cargo_check")?;
-                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
                     let result =
                         run_rust_tool(code, &["check"], Some(Duration::from_secs(30))).await?;
-
                     let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
@@ -589,14 +599,17 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-
-                    // Store analysis if requested
+                    let persist = Self::get_persist_flag(&request);
                     if let Err(e) = self.store_analysis_with_errors("cargo_check", &result, persist)
                     {
-                        eprintln!("Persistence error: {}", e);
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
                     }
-
-                    Ok(CallToolResult::structured(json_result))
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "rustc_explain" => {
                     eprintln!("🔧 Executing rustc_explain");
@@ -605,47 +618,38 @@ impl ServerHandler for RustyToolsServer {
                         .as_ref()
                         .and_then(|args| args.get("error_code"))
                         .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::invalid_params("error_code parameter required", None)
-                        })?;
-
-                    eprintln!("🔧 Explaining error code: {}", error_code);
+                        .ok_or_else(|| McpError::invalid_params("error_code is required", None))?;
 
                     let output = StdCommand::new("rustc")
                         .args(["--explain", error_code])
                         .output()
                         .map_err(|e| {
-                            eprintln!("❌ Failed to run rustc: {}", e);
-                            McpError::internal_error(format!("Failed to run rustc: {}", e), None)
+                            McpError::internal_error(
+                                format!("Failed to run rustc --explain: {}", e),
+                                None,
+                            )
                         })?;
 
-                    let explanation = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let explanation = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-                    eprintln!("✅ rustc_explain completed");
-
-                    if !output.status.success() && !stderr.is_empty() {
-                        let result = json!({
-                            "explanation": format!("Error: {}", stderr.trim()),
-                            "success": false
-                        });
-                        eprintln!("🔧 Returning error result: {:?}", result);
-                        return Ok(CallToolResult::structured(result));
-                    }
-
-                    let result = json!({
-                        "status": 0,
-                        "success": true,
-                        "stdout": explanation.trim(),
-                        "stderr": "",
-                        "duration_ms": 0
+                    let json_result = json!({
+                        "error_code": error_code,
+                        "explanation": explanation,
+                        "stderr": stderr,
+                        "success": output.status.success()
                     });
-                    eprintln!("🔧 Returning success result: {:?}", result);
-                    Ok(CallToolResult::structured(result))
+
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(!output.status.success()),
+                    })
                 }
                 "cargo_fix" => {
+                    eprintln!("🔧 Executing cargo_fix");
                     let code = get_code_arg(&request, "cargo_fix")?;
-                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
                     let result = run_rust_tool(
                         code,
@@ -653,7 +657,6 @@ impl ServerHandler for RustyToolsServer {
                         Some(Duration::from_secs(60)),
                     )
                     .await?;
-
                     let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
@@ -661,45 +664,49 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-
+                    let persist = Self::get_persist_flag(&request);
                     if let Err(e) = self.store_analysis_with_errors("cargo_fix", &result, persist) {
-                        eprintln!("Persistence error: {}", e);
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
                     }
-
-                    Ok(CallToolResult::structured(json_result))
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "cargo_audit" => {
+                    eprintln!("🔧 Executing cargo_audit");
                     let code = get_code_arg(&request, "cargo_audit")?;
-
-                    // Check if cargo-audit is installed
-                    if which::which("cargo-audit").is_err() {
-                        return Ok(CallToolResult::structured(json!({
-                            "error": "cargo-audit not installed. Install with: cargo install cargo-audit",
-                            "success": false
-                        })));
-                    }
-
+                    validate_rust_code(code)?;
+                    // cargo audit requires cargo-audit to be installed
                     let result =
-                        run_rust_tool(code, &["audit"], Some(Duration::from_secs(30))).await?;
-                    Ok(CallToolResult::structured(json!({
+                        run_rust_tool(code, &["audit"], Some(Duration::from_secs(60))).await?;
+                    let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
                         "stdout": result.stdout,
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
-                    })))
+                    });
+                    let persist = Self::get_persist_flag(&request);
+                    if let Err(e) = self.store_analysis_with_errors("cargo_audit", &result, persist)
+                    {
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
+                    }
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "cargo_test" => {
+                    eprintln!("🔧 Executing cargo_test");
                     let code = get_code_arg(&request, "cargo_test")?;
-                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
-                    let result = run_rust_tool(
-                        code,
-                        &["test", "--", "--nocapture"],
-                        Some(Duration::from_secs(60)),
-                    )
-                    .await?;
-
+                    let result =
+                        run_rust_tool(code, &["test"], Some(Duration::from_secs(60))).await?;
                     let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
@@ -707,25 +714,24 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-
+                    let persist = Self::get_persist_flag(&request);
                     if let Err(e) = self.store_analysis_with_errors("cargo_test", &result, persist)
                     {
-                        eprintln!("Persistence error: {}", e);
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
                     }
-
-                    Ok(CallToolResult::structured(json_result))
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "cargo_build" => {
+                    eprintln!("🔧 Executing cargo_build");
                     let code = get_code_arg(&request, "cargo_build")?;
-                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
-                    let result = run_rust_tool(
-                        code,
-                        &["build", "--message-format=short"],
-                        Some(Duration::from_secs(45)),
-                    )
-                    .await?;
-
+                    let result =
+                        run_rust_tool(code, &["build"], Some(Duration::from_secs(60))).await?;
                     let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
@@ -733,26 +739,29 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-
+                    let persist = Self::get_persist_flag(&request);
                     if let Err(e) = self.store_analysis_with_errors("cargo_build", &result, persist)
                     {
-                        eprintln!("Persistence error: {}", e);
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
                     }
-
-                    Ok(CallToolResult::structured(json_result))
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "cargo_search" => {
+                    eprintln!("🔧 Executing cargo_search");
                     let query = request
                         .arguments
                         .as_ref()
                         .and_then(|args| args.get("query"))
                         .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::invalid_params("query parameter required", None)
-                        })?;
+                        .ok_or_else(|| McpError::invalid_params("query is required", None))?;
 
                     let output = StdCommand::new("cargo")
-                        .args(["search", query, "--limit", "10"])
+                        .args(["search", query])
                         .output()
                         .map_err(|e| {
                             McpError::internal_error(
@@ -761,23 +770,29 @@ impl ServerHandler for RustyToolsServer {
                             )
                         })?;
 
-                    let results = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let results = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-                    Ok(CallToolResult::structured(json!({
-                        "status": output.status.code().unwrap_or(-1),
-                        "success": output.status.success(),
-                        "stdout": results.trim(),
-                        "stderr": stderr.trim(),
-                        "duration_ms": 0
-                    })))
+                    let json_result = json!({
+                        "query": query,
+                        "results": results,
+                        "stderr": stderr,
+                        "success": output.status.success()
+                    });
+
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(!output.status.success()),
+                    })
                 }
                 "cargo_tree" => {
+                    eprintln!("🔧 Executing cargo_tree");
                     let code = get_code_arg(&request, "cargo_tree")?;
-                    let persist = Self::get_persist_flag(&request);
+                    validate_rust_code(code)?;
                     let result =
                         run_rust_tool(code, &["tree"], Some(Duration::from_secs(30))).await?;
-
                     let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
@@ -785,22 +800,24 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-
+                    let persist = Self::get_persist_flag(&request);
                     if let Err(e) = self.store_analysis_with_errors("cargo_tree", &result, persist)
                     {
-                        eprintln!("Persistence error: {}", e);
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
                     }
-
-                    Ok(CallToolResult::structured(json_result))
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "cargo_doc" => {
+                    eprintln!("🔧 Executing cargo_doc");
                     let code = get_code_arg(&request, "cargo_doc")?;
-                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
                     let result =
-                        run_rust_tool(code, &["doc", "--no-deps"], Some(Duration::from_secs(60)))
-                            .await?;
-
+                        run_rust_tool(code, &["doc"], Some(Duration::from_secs(60))).await?;
                     let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
@@ -808,34 +825,28 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-
+                    let persist = Self::get_persist_flag(&request);
                     if let Err(e) = self.store_analysis_with_errors("cargo_doc", &result, persist) {
-                        eprintln!("Persistence error: {}", e);
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
                     }
-
-                    Ok(CallToolResult::structured(json_result))
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "rust_analyzer" => {
+                    eprintln!("🔧 Executing rust_analyzer");
                     let code = get_code_arg(&request, "rust_analyzer")?;
-                    let persist = Self::get_persist_flag(&request);
                     validate_rust_code(code)?;
-
-                    // Check if rust-analyzer is installed
-                    if which::which("rust-analyzer").is_err() {
-                        return Ok(CallToolResult::structured(json!({
-                            "error": "rust-analyzer not installed. Install via rustup or package manager",
-                            "success": false
-                        })));
-                    }
-
-                    // For now, just run cargo check as rust-analyzer LSP integration is complex
+                    // rust-analyzer check
                     let result = run_rust_tool(
                         code,
                         &["check", "--message-format=json"],
                         Some(Duration::from_secs(30)),
                     )
                     .await?;
-
                     let json_result = json!({
                         "status": result.status,
                         "success": result.status == 0,
@@ -843,16 +854,21 @@ impl ServerHandler for RustyToolsServer {
                         "stderr": result.stderr,
                         "duration_ms": result.duration_ms
                     });
-
+                    let persist = Self::get_persist_flag(&request);
                     if let Err(e) =
                         self.store_analysis_with_errors("rust_analyzer", &result, persist)
                     {
-                        eprintln!("Persistence error: {}", e);
+                        eprintln!("⚠️  Failed to store analysis: {}", e);
                     }
-
-                    Ok(CallToolResult::structured(json_result))
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(result.status != 0),
+                    })
                 }
                 "cargo_history" => {
+                    eprintln!("🔧 Executing cargo_history");
                     let error_code = request
                         .arguments
                         .as_ref()
@@ -864,51 +880,35 @@ impl ServerHandler for RustyToolsServer {
                         .as_ref()
                         .and_then(|args| args.get("limit"))
                         .and_then(|v| v.as_u64())
-                        .map(|v| v as usize);
+                        .unwrap_or(10) as usize;
 
-                    match &self.db {
-                        Some(db) => match db.lock() {
-                            Ok(db) => match db.get_error_history(error_code, limit) {
-                                Ok(errors) => {
-                                    let error_json: Vec<_> = errors
-                                        .iter()
-                                        .map(|e| {
-                                            json!({
-                                                "id": e.id,
-                                                "error_code": e.error_code,
-                                                "message": e.message,
-                                                "file": e.file,
-                                                "line": e.line,
-                                                "suggestion": e.suggestion,
-                                                "timestamp": e.timestamp,
-                                                "tool": e.tool
-                                            })
-                                        })
-                                        .collect();
+                    let Some(ref db_arc) = self.db else {
+                        return Err(McpError::internal_error("Database not available", None));
+                    };
 
-                                    Ok(CallToolResult::structured(json!({
-                                        "success": true,
-                                        "count": error_json.len(),
-                                        "errors": error_json
-                                    })))
-                                }
-                                Err(e) => Ok(CallToolResult::structured(json!({
-                                    "success": false,
-                                    "error": format!("Database query failed: {}", e)
-                                }))),
-                            },
-                            Err(e) => Ok(CallToolResult::structured(json!({
-                                "success": false,
-                                "error": format!("Could not access database: {}", e)
-                            }))),
-                        },
-                        None => Ok(CallToolResult::structured(json!({
-                            "success": false,
-                            "error": "Database not initialized. No historical data available."
-                        }))),
-                    }
+                    let db = db_arc.lock().map_err(|e| {
+                        McpError::internal_error(format!("Database lock failed: {}", e), None)
+                    })?;
+
+                    let history = db.get_error_history(error_code, Some(limit)).map_err(|e| {
+                        McpError::internal_error(format!("Failed to query history: {}", e), None)
+                    })?;
+
+                    let json_result = json!({
+                        "error_code": error_code,
+                        "limit": limit,
+                        "results": history
+                    });
+
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(false),
+                    })
                 }
                 "cargo_todos" => {
+                    eprintln!("🔧 Executing cargo_todos");
                     let show_completed = request
                         .arguments
                         .as_ref()
@@ -916,96 +916,57 @@ impl ServerHandler for RustyToolsServer {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
 
-                    match &self.db {
-                        Some(db) => match db.lock() {
-                            Ok(db) => match db.get_todos(show_completed) {
-                                Ok(todos) => {
-                                    let todo_json: Vec<_> = todos
-                                        .iter()
-                                        .map(|t| {
-                                            json!({
-                                                "id": t.id,
-                                                "source": t.source,
-                                                "description": t.description,
-                                                "file_path": t.file_path,
-                                                "line_number": t.line_number,
-                                                "completed": t.completed,
-                                                "created_at": t.created_at
-                                            })
-                                        })
-                                        .collect();
+                    let Some(ref db_arc) = self.db else {
+                        return Err(McpError::internal_error("Database not available", None));
+                    };
 
-                                    Ok(CallToolResult::structured(json!({
-                                        "success": true,
-                                        "count": todo_json.len(),
-                                        "todos": todo_json
-                                    })))
-                                }
-                                Err(e) => Ok(CallToolResult::structured(json!({
-                                    "success": false,
-                                    "error": format!("Database query failed: {}", e)
-                                }))),
-                            },
-                            Err(e) => Ok(CallToolResult::structured(json!({
-                                "success": false,
-                                "error": format!("Could not access database: {}", e)
-                            }))),
-                        },
-                        None => Ok(CallToolResult::structured(json!({
-                            "success": false,
-                            "error": "Database not initialized. No todo data available."
-                        }))),
-                    }
+                    let db = db_arc.lock().map_err(|e| {
+                        McpError::internal_error(format!("Database lock failed: {}", e), None)
+                    })?;
+
+                    let todos = db.get_todos(show_completed).map_err(|e| {
+                        McpError::internal_error(format!("Failed to query todos: {}", e), None)
+                    })?;
+
+                    let json_result = json!({
+                        "show_completed": show_completed,
+                        "todos": todos
+                    });
+
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(false),
+                    })
                 }
                 "db_stats" => {
                     eprintln!("🔧 Executing db_stats");
-                    match &self.db {
-                        Some(db) => match db.lock() {
-                            Ok(db) => match db.get_stats() {
-                                Ok(stats) => {
-                                    let result = json!({
-                                        "success": true,
-                                        "stats": {
-                                            "total_analyses": stats.total_analyses,
-                                            "total_errors": stats.total_errors,
-                                            "active_todos": stats.active_todos,
-                                            "completed_todos": stats.completed_todos
-                                        }
-                                    });
-                                    eprintln!("✅ db_stats completed: {:?}", result);
-                                    Ok(CallToolResult::structured(result))
-                                }
-                                Err(e) => {
-                                    let result = json!({
-                                        "success": false,
-                                        "error": format!("Failed to get stats: {}", e)
-                                    });
-                                    eprintln!("❌ db_stats failed: {:?}", result);
-                                    Ok(CallToolResult::structured(result))
-                                }
-                            },
-                            Err(e) => {
-                                let result = json!({
-                                    "success": false,
-                                    "error": format!("Could not access database: {}", e)
-                                });
-                                eprintln!("❌ db_stats lock failed: {:?}", result);
-                                Ok(CallToolResult::structured(result))
-                            }
-                        },
-                        None => {
-                            let result = json!({
-                                "success": false,
-                                "error": "Database not initialized."
-                            });
-                            eprintln!("❌ db_stats no database: {:?}", result);
-                            Ok(CallToolResult::structured(result))
-                        }
-                    }
+                    let Some(ref db_arc) = self.db else {
+                        return Err(McpError::internal_error("Database not available", None));
+                    };
+
+                    let db = db_arc.lock().map_err(|e| {
+                        McpError::internal_error(format!("Database lock failed: {}", e), None)
+                    })?;
+
+                    let stats = db.get_stats().map_err(|e| {
+                        McpError::internal_error(format!("Failed to get stats: {}", e), None)
+                    })?;
+
+                    let json_result = json!(stats);
+
+                    Ok(CallToolResult {
+                        content: vec![rmcp::model::Content::text(json_result.to_string())],
+                        structured_content: None,
+                        meta: None,
+                        is_error: Some(false),
+                    })
                 }
-                _ => Err(McpError::method_not_found::<
-                    rmcp::model::CallToolRequestMethod,
-                >()),
+                _ => Err(McpError::internal_error(
+                    format!("Unknown tool: {}", request.name),
+                    None,
+                )),
             }
         }
     }
@@ -1044,14 +1005,398 @@ fn validate_rust_code(code: &str) -> Result<(), McpError> {
     Ok(())
 }
 
-struct ExecResult {
-    stdout: String,
-    stderr: String,
-    status: i32,
-    duration_ms: u128,
+pub struct Database {
+    conn: Connection,
 }
 
-async fn run_rust_tool(
+impl Database {
+    pub fn new(mode: PersistenceMode) -> Result<Option<Self>> {
+        match mode {
+            PersistenceMode::Disabled => Ok(None),
+            PersistenceMode::Path(path) => {
+                let conn = Connection::open(&path)?;
+
+                // Create parent directory if it doesn't exist
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                let db = Database { conn };
+                db.init_schema()?;
+                Ok(Some(db))
+            }
+        }
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        // Create analyses table
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                file_path TEXT,
+                tool TEXT NOT NULL,
+                full_output TEXT NOT NULL,
+                success BOOLEAN NOT NULL
+            )",
+            [],
+        )?;
+
+        // Create errors table
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_id INTEGER NOT NULL,
+                error_code TEXT,
+                message TEXT NOT NULL,
+                file TEXT,
+                line INTEGER,
+                suggestion TEXT,
+                FOREIGN KEY (analysis_id) REFERENCES analyses (id)
+            )",
+            [],
+        )?;
+
+        // Create todos table - fix column type issues
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                source TEXT NOT NULL,
+                description TEXT NOT NULL,
+                file_path TEXT,
+                line_number INTEGER,
+                completed INTEGER DEFAULT 0
+            )",
+            [],
+        )?;
+
+        // Create fixes table
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS fixes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                error_id INTEGER,
+                fix_applied TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                worked INTEGER,
+                FOREIGN KEY (error_id) REFERENCES errors (id)
+            )",
+            [],
+        )?;
+
+        // Add timestamp column to existing errors table if it doesn't exist
+        let _ = self.conn.execute(
+            "ALTER TABLE errors ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP",
+            [],
+        );
+
+        Ok(())
+    }
+
+    pub fn store_analysis(
+        &self,
+        tool: &str,
+        full_output: &Value,
+        success: bool,
+        file_path: Option<&str>,
+    ) -> Result<i64> {
+        use rusqlite::params;
+        let full_output_str = full_output.to_string();
+
+        self.conn.execute(
+            "INSERT INTO analyses (tool, full_output, success, file_path) VALUES (?1, ?2, ?3, ?4)",
+            params![tool, full_output_str, success, file_path],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn store_error(
+        &self,
+        analysis_id: i64,
+        error_code: Option<&str>,
+        message: &str,
+        file: Option<&str>,
+        line: Option<i32>,
+        suggestion: Option<&str>,
+    ) -> Result<()> {
+        use rusqlite::params;
+        self.conn.execute(
+            "INSERT INTO errors (analysis_id, error_code, message, file, line, suggestion) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                analysis_id,
+                error_code,
+                message,
+                file,
+                line,
+                suggestion
+            ]
+        )?;
+        Ok(())
+    }
+
+    pub fn store_todo(
+        &self,
+        source: &str,
+        description: &str,
+        file_path: Option<&str>,
+        line_number: Option<i32>,
+    ) -> Result<()> {
+        use rusqlite::params;
+        self.conn.execute(
+            "INSERT INTO todos (source, description, file_path, line_number) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                source,
+                description,
+                file_path,
+                line_number
+            ]
+        )?;
+        Ok(())
+    }
+
+    pub fn get_error_history(
+        &self,
+        error_code: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ErrorRecord>> {
+        use rusqlite::params;
+        let limit = limit.unwrap_or(10) as i64;
+
+        let mut errors = Vec::new();
+
+        // Check if timestamp column exists in errors table
+        let has_timestamp = self
+            .conn
+            .prepare("SELECT timestamp FROM errors LIMIT 1")
+            .is_ok();
+
+        if let Some(code) = error_code {
+            let sql = if has_timestamp {
+                "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion,
+                        COALESCE(e.timestamp, a.timestamp) as timestamp, a.tool
+                 FROM errors e
+                 JOIN analyses a ON e.analysis_id = a.id
+                 WHERE e.error_code = ?1
+                 ORDER BY COALESCE(e.timestamp, a.timestamp) DESC
+                 LIMIT ?2"
+            } else {
+                "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion,
+                        a.timestamp, a.tool
+                 FROM errors e
+                 JOIN analyses a ON e.analysis_id = a.id
+                 WHERE e.error_code = ?1
+                 ORDER BY a.timestamp DESC
+                 LIMIT ?2"
+            };
+            let mut stmt = self.conn.prepare(sql)?;
+            let error_iter = stmt.query_map(params![code, limit], |row| {
+                Ok(ErrorRecord {
+                    id: row.get(0)?,
+                    error_code: row.get::<_, Option<String>>(1)?,
+                    message: row.get(2)?,
+                    file: row.get::<_, Option<String>>(3)?,
+                    line: row.get::<_, Option<i32>>(4)?,
+                    suggestion: row.get::<_, Option<String>>(5)?,
+                    timestamp: row.get(6)?,
+                    tool: row.get(7)?,
+                })
+            })?;
+
+            for error in error_iter {
+                errors.push(error?);
+            }
+        } else {
+            let sql = if has_timestamp {
+                "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion,
+                        COALESCE(e.timestamp, a.timestamp) as timestamp, a.tool
+                 FROM errors e
+                 JOIN analyses a ON e.analysis_id = a.id
+                 ORDER BY COALESCE(e.timestamp, a.timestamp) DESC
+                 LIMIT ?1"
+            } else {
+                "SELECT e.id, e.error_code, e.message, e.file, e.line, e.suggestion,
+                        a.timestamp, a.tool
+                 FROM errors e
+                 JOIN analyses a ON e.analysis_id = a.id
+                 ORDER BY a.timestamp DESC
+                 LIMIT ?1"
+            };
+            let mut stmt = self.conn.prepare(sql)?;
+            let error_iter = stmt.query_map(params![limit], |row| {
+                Ok(ErrorRecord {
+                    id: row.get(0)?,
+                    error_code: row.get::<_, Option<String>>(1)?,
+                    message: row.get(2)?,
+                    file: row.get::<_, Option<String>>(3)?,
+                    line: row.get::<_, Option<i32>>(4)?,
+                    suggestion: row.get::<_, Option<String>>(5)?,
+                    timestamp: row.get(6)?,
+                    tool: row.get(7)?,
+                })
+            })?;
+
+            for error in error_iter {
+                errors.push(error?);
+            }
+        }
+
+        Ok(errors)
+    }
+
+    pub fn get_todos(&self, show_completed: bool) -> Result<Vec<TodoRecord>> {
+        let sql = if show_completed {
+            "SELECT id, source, description, file_path,
+                    CAST(line_number AS INTEGER) as line_number,
+                    completed, created_at
+             FROM todos
+             ORDER BY created_at DESC"
+        } else {
+            "SELECT id, source, description, file_path,
+                    CAST(line_number AS INTEGER) as line_number,
+                    completed, created_at
+             FROM todos
+             WHERE completed = 0
+             ORDER BY created_at DESC"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let todo_iter = stmt.query_map([], |row| {
+            // Handle line_number more carefully to avoid type issues
+            let line_number: Option<i32> = match row.get::<_, Option<rusqlite::types::Value>>(4)? {
+                Some(rusqlite::types::Value::Integer(i)) => Some(i as i32),
+                Some(rusqlite::types::Value::Text(s)) => s.parse().ok(),
+                Some(rusqlite::types::Value::Null) | None => None,
+                _ => None,
+            };
+
+            Ok(TodoRecord {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                description: row.get(2)?,
+                file_path: row.get::<_, Option<String>>(3)?,
+                line_number,
+                completed: row.get::<_, i32>(5)? != 0, // Convert INTEGER to bool
+                created_at: row.get(6)?,
+            })
+        })?;
+
+        let mut todos = Vec::new();
+        for todo in todo_iter {
+            todos.push(todo?);
+        }
+        Ok(todos)
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_todo_completed(&self, todo_id: i64) -> Result<()> {
+        use rusqlite::params;
+        self.conn.execute(
+            "UPDATE todos SET completed = 1 WHERE id = ?1",
+            params![todo_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get statistics about stored data
+    pub fn get_stats(&self) -> Result<DatabaseStats> {
+        let analyses_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM analyses", [], |row| row.get(0))?;
+
+        let errors_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM errors", [], |row| row.get(0))?;
+
+        let todos_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM todos WHERE completed = 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let completed_todos_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM todos WHERE completed = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(DatabaseStats {
+            total_analyses: analyses_count as usize,
+            total_errors: errors_count as usize,
+            active_todos: todos_count as usize,
+            completed_todos: completed_todos_count as usize,
+        })
+    }
+
+    /// Clean up old data beyond a certain limit
+    #[allow(dead_code)]
+    pub fn cleanup_old_data(&self, keep_analyses: usize) -> Result<()> {
+        use rusqlite::params;
+
+        // Delete old analyses and their associated errors
+        self.conn.execute(
+            "DELETE FROM errors WHERE analysis_id IN (
+                SELECT id FROM analyses
+                ORDER BY timestamp DESC
+                LIMIT -1 OFFSET ?1
+            )",
+            params![keep_analyses],
+        )?;
+
+        self.conn.execute(
+            "DELETE FROM analyses
+             WHERE id NOT IN (
+                SELECT id FROM analyses
+                ORDER BY timestamp DESC
+                LIMIT ?1
+             )",
+            params![keep_analyses],
+        )?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ErrorRecord {
+    pub id: i64,
+    pub error_code: Option<String>,
+    pub message: String,
+    pub file: Option<String>,
+    pub line: Option<i32>,
+    pub suggestion: Option<String>,
+    pub timestamp: String,
+    pub tool: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TodoRecord {
+    pub id: i64,
+    pub source: String,
+    pub description: String,
+    pub file_path: Option<String>,
+    pub line_number: Option<i32>,
+    pub completed: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DatabaseStats {
+    pub total_analyses: usize,
+    pub total_errors: usize,
+    pub active_todos: usize,
+    pub completed_todos: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ExecResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub status: i32,
+    pub duration_ms: u128,
+}
+
+pub async fn run_rust_tool(
     code: &str,
     args: &[&str],
     timeout: Option<Duration>,
@@ -1158,21 +1503,4 @@ async fn run_rust_tool(
         status,
         duration_ms,
     })
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Log server start to stderr (won't interfere with MCP protocol)
-    eprintln!("🚀 Rusty Tools MCP Server starting...");
-
-    let handler = RustyToolsServer::new();
-    let service = handler
-        .serve(stdio())
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to start server: {}", e))?;
-
-    service.waiting().await?;
-
-    eprintln!("🛑 Rusty Tools MCP Server shutting down");
-    Ok(())
 }
